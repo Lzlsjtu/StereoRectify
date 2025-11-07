@@ -5,10 +5,10 @@ from stereo_rectify import rectify_images
 
 
 if __name__ == "__main__":
-    left_image_path = "../1030/viewpoint1/left.png"
-    right_image_path = "../1030/viewpoint1/right.png"
-    json_path = "../1030/viewpoint1/params.json"
-    output_dir = "../1030_rectified"
+    left_image_path = "viewpoint1/left.png"
+    right_image_path = "viewpoint1/right.png"
+    json_path = "viewpoint1/params.json"
+    output_dir = "rectified"
     os.makedirs(output_dir, exist_ok=True)
 
     corrected_left_path = os.path.join(output_dir, "left_rectified.png")
