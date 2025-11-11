@@ -122,11 +122,24 @@ def calculate_bounding_box(all_coords):
     返回:
         tuple: (x_min, x_max, y_min, y_max)
     """
-    # 将所有坐标点展开成二维数组
-    all_coords = np.array([p for coords in all_coords for p in coords])
-    # 分别计算 x, y 的最小与最大值
-    x_min, y_min = all_coords.min(axis=0)
-    x_max, y_max = all_coords.max(axis=0)
+    all_coords = np.array(all_coords, dtype=np.float64)
+
+    # 自动修正：若是一维（例如 [x1,y1,x2,y2,...]），则 reshape 成 Nx2
+    if all_coords.ndim == 1:
+        if len(all_coords) % 2 != 0:
+            raise ValueError(f"输入坐标长度 {len(all_coords)} 不是偶数，无法reshape为(N,2)。")
+        all_coords = all_coords.reshape(-1, 2)
+
+    # 若是多组坐标 [[(x,y)...], [(x,y)...]]，展平
+    if all_coords.ndim == 3:
+        all_coords = all_coords.reshape(-1, 2)
+
+    # 最终检查形状
+    if all_coords.ndim != 2 or all_coords.shape[1] != 2:
+        raise ValueError(f"输入坐标形状错误: {all_coords.shape}, 应为 (N, 2)")
+
+    x_min, y_min = np.min(all_coords, axis=0)
+    x_max, y_max = np.max(all_coords, axis=0)
     return x_min, x_max, y_min, y_max
 
 
@@ -147,29 +160,241 @@ def process_camera_coordinates(image, cameraMatrix, R, newCameraMatrix):
         newCameraMatrix (np.ndarray): 新相机内参矩阵
 
     返回:
-        list: 投影后角点的像素坐标 [(x', y'), ...]
+        np.ndarray: 投影后角点的像素坐标，形状为 (N, 2)
+                    [[x1', y1'], [x2', y2'], ...]
     """
-    # 获取图像宽高
     h, w = image.shape[:2]
 
-    # 定义原图像的四个角点
-    corners = np.array([[0, 0], [w, 0], [0, h], [w, h]], dtype=np.float64)
+    # 定义原图像四个角点
+    corners = np.array([[0, 0],
+                        [w, 0],
+                        [0, h],
+                        [w, h]], dtype=np.float64)
 
-    # 计算原相机矩阵的逆矩阵（将像素坐标映射到相机坐标系）
+    # 计算原相机矩阵的逆矩阵
     cameraMatrixInv = np.linalg.inv(cameraMatrix)
 
     projected = []
     for x, y in corners:
-        # 将像素坐标表示为齐次坐标形式
         p = np.array([[x], [y], [1.0]])
-
-        # 将像素坐标转为相机坐标，再应用旋转变换
         cam_coord = R @ (cameraMatrixInv @ p)
-
-        # 再投影回新相机平面
         proj = newCameraMatrix @ cam_coord
+        x_proj = proj[0, 0] / proj[2, 0]
+        y_proj = proj[1, 0] / proj[2, 0]
+        projected.append([x_proj, y_proj])
 
-        # 齐次归一化得到最终像素坐标
-        projected.append((proj[0, 0] / proj[2, 0], proj[1, 0] / proj[2, 0]))
-
+    # ⚠️ 转为 NumPy 数组，确保形状为 (N,2)
+    projected = np.array(projected, dtype=np.float64)
     return projected
+
+def unified_intrinsics_rectify(
+    left_path: str,
+    right_path: str,
+    cameraMatrix1: np.ndarray,
+    cameraMatrix2: np.ndarray,
+    R1: np.ndarray,
+    R2: np.ndarray,
+    res_scale: float = 1.0,
+    fov_scale: float = 1.0
+):
+    """
+    生成自适应完整视场投影，使左右图像分辨率相等且 fx, fy 完全一致。
+
+    功能说明：
+        - 自动根据左右相机的参数，生成一个新的统一相机矩阵。
+        - fx, fy 取两台相机内参中 fx1, fx2, fy1, fy2 的平均值。
+        - 图像分辨率由视场和分辨率因子自动决定(以光轴与图像坐标系交点为中心缩放)：
+            - res_scale：
+                - 分辨率缩放因子:
+                - 仅作用在 fx, fy 上，
+                - 由自适应机制导致分辨率同步变化；
+                - 图片内容实际不变
+            - fov_scale：
+                - 视场缩放因子：
+                - 作用在图像尺寸上
+                - 传感器像素大小不变，尺寸由中心向内收缩
+                - 视场变小，图片内容放大
+
+    参数:
+        left_path (str): 左图路径
+        right_path (str): 右图路径
+        cameraMatrix1 (np.ndarray): 左相机内参矩阵
+        cameraMatrix2 (np.ndarray): 右相机内参矩阵
+        R1, R2 (np.ndarray): 左右旋转矩阵 (3x3)
+        process_camera_coordinates (function): 角点投影函数
+        calculate_bounding_box (function): 边界框计算函数
+        update_intrinsic_matrix (function): 内参更新函数
+        res_scale (float): 分辨率调整因子（仅作用在 fx, fy 上）
+        fov_scale (float): 视场调整因子（仅作用在图像尺寸和光心确定上）
+
+    返回:
+        tuple:
+            newCameraMatrix (np.ndarray): 更新后的统一内参矩阵
+            new_size (tuple): 新图像尺寸 (width, height)
+            (coords_left, coords_right): 投影后的角点坐标
+    """
+
+    # -------------------------------
+    # 1️⃣ 计算平均焦距 fx, fy
+    # -------------------------------
+    fx_avg = (cameraMatrix1[0, 0] + cameraMatrix2[0, 0]) / 2
+    fy_avg = (cameraMatrix1[1, 1] + cameraMatrix2[1, 1]) / 2
+    fx_fy_mean = (fx_avg + fy_avg) / 2  # 四个值的平均
+
+    # -------------------------------
+    # 2️⃣ 构造新的相机矩阵
+    # -------------------------------
+    newCameraMatrix = np.eye(3, dtype=np.float64)
+    newCameraMatrix[0, 0] = fx_fy_mean * res_scale
+    newCameraMatrix[1, 1] = fx_fy_mean * res_scale
+
+    # -------------------------------
+    # 3️⃣ 读取左右图像
+    # -------------------------------
+    img_left = cv2.imread(left_path)
+    img_right = cv2.imread(right_path)
+
+    if img_left is None or img_right is None:
+        raise FileNotFoundError("❌ 图像加载失败，请检查输入路径！")
+
+    # -------------------------------
+    # 4️⃣ 投影角点到新相机坐标系
+    # -------------------------------
+    coords_left = process_camera_coordinates(img_left, cameraMatrix1, R1, newCameraMatrix)
+    coords_right = process_camera_coordinates(img_right, cameraMatrix2, R2, newCameraMatrix)
+
+    # -------------------------------
+    # 5️⃣ 计算完整视场边界
+    # -------------------------------
+    x_min, x_max, y_min, y_max = calculate_bounding_box([coords_left, coords_right])
+
+    # -------------------------------
+    # 6️⃣ 计算新的光心位置(以图像坐标系中心缩放fov_scale)
+    # -------------------------------
+    new_cx = (x_max - x_min) * fov_scale/2 - (x_max + x_min)/2
+    new_cy = (y_max - y_min) / 2 * fov_scale
+    newCameraMatrix = update_intrinsic_matrix(newCameraMatrix, new_cx, new_cy)
+
+    print("✅ 更新后的统一内参矩阵:\n", newCameraMatrix)
+
+    # -------------------------------
+    # 7️⃣ 计算新图像尺寸（自适应机制不受res_scale影响，受fov_scale影响）
+    # -------------------------------
+    width = int((x_max - x_min) * fov_scale)
+    height = int((y_max - y_min) * fov_scale)
+    new_size = (width, height)
+
+    print(f"✅ 新图像分辨率: {new_size} (res_scale={res_scale}, fov_scale={fov_scale})")
+
+    return (newCameraMatrix, newCameraMatrix), new_size, (coords_left, coords_right)
+
+def unified_dual_intrinsics_rectify(
+    left_path: str,
+    right_path: str,
+    cameraMatrix1: np.ndarray,
+    cameraMatrix2: np.ndarray,
+    R1: np.ndarray,
+    R2: np.ndarray,
+    res_scale: float = 1.0,
+    fov_scale: float = 1.0
+):
+    """
+    生成自适应完整视场投影（左右光心独立、分辨率统一）。
+
+    功能说明：
+        - 自动根据左右相机的参数生成两个独立的新相机矩阵（左右光心独立计算）。
+        - fx, fy 完全相同，取两相机平均值。
+        - 分辨率保证左右图一致（取左右各自FOV范围的最大宽高）。
+        - 光心位置计算规则：
+            * 左图光心 cx_left = (x1_max - x1_min) * fov_scale/2 - (x1_max + x1_min)/2
+            * 右图光心 cx_right = (x2_max - x2_min) * fov_scale/2 - (x2_max + x2_min)/2
+            * 两图光心的 cy 相同 = 新图像高度的一半（保证水平对齐）
+
+    参数:
+        left_path (str): 左图路径
+        right_path (str): 右图路径
+        cameraMatrix1 (np.ndarray): 左相机内参矩阵
+        cameraMatrix2 (np.ndarray): 右相机内参矩阵
+        R1, R2 (np.ndarray): 左右旋转矩阵 (3x3)
+        res_scale (float): 分辨率缩放因子（仅作用在 fx, fy 上）
+        fov_scale (float): 视场缩放因子（仅作用在图像尺寸和光心确定上）
+
+    返回:
+        tuple:
+            (newCameraMatrix_left, newCameraMatrix_right): 左右新相机矩阵
+            new_size (tuple): 统一新图像尺寸 (width, height)
+            (coords_left, coords_right): 投影后的角点坐标
+    """
+
+    # -------------------------------
+    # 1️⃣ 计算平均焦距 fx, fy
+    # -------------------------------
+    fx_avg = (cameraMatrix1[0, 0] + cameraMatrix2[0, 0]) / 2
+    fy_avg = (cameraMatrix1[1, 1] + cameraMatrix2[1, 1]) / 2
+    fx_fy_mean = (fx_avg + fy_avg) / 2
+
+    # -------------------------------
+    # 2️⃣ 构造新的基础相机矩阵（左右共用 fx, fy）
+    # -------------------------------
+    baseK = np.eye(3, dtype=np.float64)
+    baseK[0, 0] = fx_fy_mean * res_scale
+    baseK[1, 1] = fx_fy_mean * res_scale
+
+    # -------------------------------
+    # 3️⃣ 读取左右图像
+    # -------------------------------
+    img_left = cv2.imread(left_path)
+    img_right = cv2.imread(right_path)
+    if img_left is None or img_right is None:
+        raise FileNotFoundError("❌ 图像加载失败，请检查输入路径！")
+
+    # -------------------------------
+    # 4️⃣ 投影角点到新相机坐标系
+    # -------------------------------
+    coords_left = process_camera_coordinates(img_left, cameraMatrix1, R1, baseK)
+    coords_right = process_camera_coordinates(img_right, cameraMatrix2, R2, baseK)
+
+    # -------------------------------
+    # 5️⃣ 计算左右各自边界
+    # -------------------------------
+    x1_min, x1_max, y1_min, y1_max = calculate_bounding_box(coords_left)
+    x2_min, x2_max, y2_min, y2_max = calculate_bounding_box(coords_right)
+
+    # -------------------------------
+    # 6️⃣ 计算统一的图像分辨率（取最大宽高）
+    # -------------------------------
+    max_width = max(x1_max - x1_min, x2_max - x2_min)
+    max_height = max(y1_max - y1_min, y2_max - y2_min)
+
+    width = int(max_width * fov_scale)
+    height = int(max_height * fov_scale)
+    new_size = (width, height)
+
+    # -------------------------------
+    # 7️⃣ 分别计算左右光心位置
+    # -------------------------------
+    cx_left = (x1_max - x1_min) * fov_scale/2 - (x1_max + x1_min)/2
+    cx_right = (x2_max - x2_min) * fov_scale/2 - (x2_max + x2_min)/2
+    cy = height / 2  # 保证水平对齐
+
+    # -------------------------------
+    # 8️⃣ 构造左右相机新内参矩阵
+    # -------------------------------
+    newCameraMatrix_left = baseK.copy()
+    newCameraMatrix_left[0, 2] = cx_left
+    newCameraMatrix_left[1, 2] = cy
+
+    newCameraMatrix_right = baseK.copy()
+    newCameraMatrix_right[0, 2] = cx_right
+    newCameraMatrix_right[1, 2] = cy
+
+    # -------------------------------
+    # 9️⃣ 输出调试信息
+    # -------------------------------
+    print("✅ 左相机新内参矩阵:\n", newCameraMatrix_left)
+    print("✅ 右相机新内参矩阵:\n", newCameraMatrix_right)
+    print(f"✅ 统一新图像尺寸: {new_size} (res_scale={res_scale}, fov_scale={fov_scale})")
+    print(f"✅ 左右光心坐标: cx_left={cx_left:.2f}, cx_right={cx_right:.2f}, cy={cy:.2f}")
+
+    return (newCameraMatrix_left, newCameraMatrix_right), new_size, (coords_left, coords_right)
+
