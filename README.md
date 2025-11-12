@@ -36,10 +36,7 @@ pip install -r requirements.txt
 ### 2️⃣ 运行示例
 
 ```bash
-python rectification.py \
-  --left data/left.png \
-  --right data/right.png \
-  --output results/
+python rectification.py 
 ```
 
 运行后将在 `results/` 文件夹下生成校正后的左右图像。
@@ -50,11 +47,11 @@ python rectification.py \
 
 ```
 StereoRectify/
-├── rectification.py        # 校正主流程
-├── intrinsics_update.py    # 新内参生成
-├── utils.py                # 几何计算辅助函数
-├── data/                   # 示例输入图像
-├── results/                # 校正输出结果
+├── stereo_rectify.py        # 校正主流程
+├── stereo_io_vis.py    # 新内参生成
+├── stereo_math.py                # 几何计算辅助函数
+├── demo_stereo_rectify                   # 示例输入图像
+├── viewpoint1/                # 原始输入信息
 └── 基于完整视场保留的双目立体校正算法.md
 ```
 
@@ -95,3 +92,4 @@ StereoRectify/
 ## 📜 License
 
 本项目基于 **MIT License** 开源，欢迎自由使用与修改。
+
